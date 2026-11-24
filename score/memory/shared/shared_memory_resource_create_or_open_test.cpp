@@ -146,6 +146,99 @@ TEST_F(SharedMemoryResourceCreateOrOpenTest, SharedMemoryOpenedWhenSharedMemoryI
     EXPECT_FALSE(isInitialized);
 }
 
+TEST_F(SharedMemoryResourceCreateOrOpenTest, SharedMemoryCreatedWhenCreateLockIsOnlyHeldByAnotherOpener)
+{
+    InSequence sequence{};
+    constexpr std::int32_t file_descriptor = 5;
+    constexpr std::int32_t lock_file_descriptor = 1;
+    constexpr std::int32_t first_open_lock_file_descriptor = 10;
+    constexpr std::int32_t second_open_lock_file_descriptor = 11;
+    constexpr bool is_read_write = true;
+    bool isInitialized = false;
+
+    // Given that the shared memory region doesn't exist when we first try to open it
+    expectCreateLockFileReturns(TestValues::sharedMemorySegmentLockPath, first_open_lock_file_descriptor);
+    expectShmOpenReturns(TestValues::sharedMemorySegmentPath,
+                         score::cpp::make_unexpected(Error::createFromErrno(ENOENT)),
+                         is_read_write);
+    EXPECT_CALL(*unistd_mock_, close(first_open_lock_file_descriptor));
+    EXPECT_CALL(*unistd_mock_, unlink(StrEq(TestValues::sharedMemorySegmentLockPath)));
+
+    // And we cannot create the lock file because another process is holding it
+    expectCreateLockFileReturns(TestValues::sharedMemorySegmentLockPath,
+                                score::cpp::make_unexpected(Error::createFromErrno(EEXIST)));
+
+    // And that process was only trying to open the region, so the region still doesn't exist when we open it again
+    expectCreateLockFileReturns(TestValues::sharedMemorySegmentLockPath, second_open_lock_file_descriptor);
+    expectShmOpenReturns(TestValues::sharedMemorySegmentPath,
+                         score::cpp::make_unexpected(Error::createFromErrno(ENOENT)),
+                         is_read_write);
+    EXPECT_CALL(*unistd_mock_, close(second_open_lock_file_descriptor));
+    EXPECT_CALL(*unistd_mock_, unlink(StrEq(TestValues::sharedMemorySegmentLockPath)));
+
+    // Then we try to create the shared memory region again and succeed
+    alignas(alignof(std::max_align_t)) std::array<std::uint8_t, 500U> dataRegion{};
+    expectSharedMemorySuccessfullyCreated(file_descriptor, lock_file_descriptor, dataRegion.data());
+    EXPECT_CALL(*mman_mock_, munmap(_, _));
+    EXPECT_CALL(*unistd_mock_, close(file_descriptor));
+
+    // When creating or opening a shared memory region with CreateOrOpen
+    auto resource_result =
+        SharedMemoryResourceTestAttorney::CreateOrOpen(TestValues::sharedMemorySegmentPath,
+                                                       TestValues::some_share_memory_size,
+                                                       [&isInitialized](std::shared_ptr<ManagedMemoryResource>) {
+                                                           isInitialized = true;
+                                                       });
+    ASSERT_TRUE(resource_result.has_value());
+
+    // And the initialization callback was invoked
+    EXPECT_TRUE(isInitialized);
+}
+
+TEST_F(SharedMemoryResourceCreateOrOpenTest, CreateOrOpenReturnsNoSuchFileWhenCreationKeepsLosingTheLock)
+{
+    InSequence sequence{};
+    constexpr std::int32_t open_lock_file_descriptor = 10;
+    constexpr std::size_t max_attempts = 10U;
+    constexpr bool is_read_write = true;
+    bool isInitialized = false;
+
+    // Given that the first open attempt finds no shared memory region
+    expectCreateLockFileReturns(TestValues::sharedMemorySegmentLockPath, open_lock_file_descriptor);
+    expectShmOpenReturns(TestValues::sharedMemorySegmentPath,
+                         score::cpp::make_unexpected(Error::createFromErrno(ENOENT)),
+                         is_read_write);
+    EXPECT_CALL(*unistd_mock_, close(open_lock_file_descriptor));
+    EXPECT_CALL(*unistd_mock_, unlink(StrEq(TestValues::sharedMemorySegmentLockPath)));
+
+    // And every create attempt finds the lock taken and the following open attempt finds no shared memory region
+    for (std::size_t attempt = 0U; attempt < max_attempts; ++attempt)
+    {
+        expectCreateLockFileReturns(TestValues::sharedMemorySegmentLockPath,
+                                    score::cpp::make_unexpected(Error::createFromErrno(EEXIST)));
+
+        expectCreateLockFileReturns(TestValues::sharedMemorySegmentLockPath, open_lock_file_descriptor);
+        expectShmOpenReturns(TestValues::sharedMemorySegmentPath,
+                             score::cpp::make_unexpected(Error::createFromErrno(ENOENT)),
+                             is_read_write);
+        EXPECT_CALL(*unistd_mock_, close(open_lock_file_descriptor));
+        EXPECT_CALL(*unistd_mock_, unlink(StrEq(TestValues::sharedMemorySegmentLockPath)));
+    }
+
+    // When creating or opening a shared memory region with CreateOrOpen
+    auto resource_result =
+        SharedMemoryResourceTestAttorney::CreateOrOpen(TestValues::sharedMemorySegmentPath,
+                                                       TestValues::some_share_memory_size,
+                                                       [&isInitialized](std::shared_ptr<ManagedMemoryResource>) {
+                                                           isInitialized = true;
+                                                       });
+
+    // Then we give up with the error of the last open attempt
+    ASSERT_FALSE(resource_result.has_value());
+    EXPECT_EQ(resource_result.error(), Error::Code::kNoSuchFileOrDirectory);
+    EXPECT_FALSE(isInitialized);
+}
+
 using SharedMemoryResourceCreateOrOpenDeathTest = SharedMemoryResourceCreateOrOpenTest;
 TEST_F(SharedMemoryResourceCreateOrOpenDeathTest, OpeningSharedMemoryWithUnknownErrorTerminates)
 {

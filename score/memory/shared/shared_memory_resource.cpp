@@ -84,6 +84,9 @@ constexpr auto kTmpPathPrefix = "/tmp";
 // coverity[autosar_cpp14_a16_0_1_violation]
 #endif
 
+// A failed create attempt can be caused by a concurrent opener holding the lock file, so CreateOrOpen retries.
+constexpr std::size_t kMaxCreateOrOpenAttempts{10U};
+
 constexpr auto readWriteAccessForUser = Stat::Mode::kReadUser | Stat::Mode::kWriteUser;
 constexpr auto readAccessForEveryBody = readWriteAccessForUser | Stat::Mode::kReadGroup | Stat::Mode::kReadOthers;
 // coverity[autosar_cpp14_a0_1_1_violation] false-positive: used in mask compensation
@@ -360,7 +363,7 @@ score::cpp::expected<std::shared_ptr<SharedMemoryResource>, score::os::Error> Sh
     std::shared_ptr<score::memory::shared::TypedMemory> typed_memory_ptr)
 {
     auto resource = CreateInstance(std::move(input_path), std::move(acl_factory), typed_memory_ptr);
-    const auto result = resource->CreateImpl(user_space_to_reserve, std::move(initialize_callback), permissions);
+    const auto result = resource->CreateImpl(user_space_to_reserve, initialize_callback, permissions);
     if (!result.has_value())
     {
         score::mw::log::LogError("shm") << "Unexpected error while creating Shared Memory Resource with errno"
@@ -381,7 +384,7 @@ score::cpp::expected<std::shared_ptr<SharedMemoryResource>, score::os::Error> Sh
     std::shared_ptr<score::memory::shared::TypedMemory> typed_memory_ptr)
 {
     auto resource = CreateInstance(shared_memory_resource_id, std::move(acl_factory), typed_memory_ptr);
-    const auto result = resource->CreateImpl(user_space_to_reserve, std::move(initialize_callback), permissions);
+    const auto result = resource->CreateImpl(user_space_to_reserve, initialize_callback, permissions);
     // LCOV_EXCL_START (Defensive programming: CreateAnonymous either returns a valid result or terminates.)
     // LCOV_EXCL_BR_START (See line coverage suppression explanation)
     if (!result.has_value())
@@ -497,7 +500,7 @@ SharedMemoryResource::SharedMemoryResource(std::variant<std::string, std::uint64
 // std::terminate call.
 // coverity[autosar_cpp14_a15_5_3_violation : FALSE]
 score::cpp::expected_blank<Error> SharedMemoryResource::CreateImpl(const std::size_t user_space_to_reserve,
-                                                                   const InitializeCallback initialize_callback,
+                                                                   const InitializeCallback& initialize_callback,
                                                                    const UserPermissions& permissions)
 {
     this->opening_mode_ = Fcntl::Open::kReadWrite;
@@ -559,44 +562,55 @@ score::cpp::expected_blank<Error> SharedMemoryResource::CreateOrOpenImpl(const s
     this->opening_mode_ = Fcntl::Open::kReadWrite;
     this->map_mode_ = ::score::os::Mman::Protection::kRead | ::score::os::Mman::Protection::kWrite;
     constexpr bool open_read_write{true};
-    const auto open_result = OpenImpl(open_read_write);
-    if (!open_result.has_value())
+    auto open_result = OpenImpl(open_read_write);
+    if (open_result.has_value())
     {
-        if (open_result.error() == Error::Code::kNoSuchFileOrDirectory)
+        return {};
+    }
+    if (open_result.error() != Error::Code::kNoSuchFileOrDirectory)
+    {
+        score::mw::log::LogFatal("shm") << __func__ << __LINE__
+                                        << "Unexpected error while opening Shared Memory Resource" << *path
+                                        << "with errno" << open_result.error();
+        std::terminate();
+    }
+
+    for (std::size_t attempt{0U}; attempt < kMaxCreateOrOpenAttempts; ++attempt)
+    {
+        score::mw::log::LogDebug("shm") << "Could not open shared-memory resource with path" << *path << "with errno"
+                                        << open_result.error() << "Attempting to create it now instead.";
+
+        const auto creation_result = CreateImpl(user_space_to_reserve, initialize_callback, permissions);
+        if (creation_result.has_value())
         {
-            score::mw::log::LogDebug("shm")
-                << "Could not open shared-memory resource with path" << *path << "with errno" << open_result.error()
-                << "Attempting to create it now instead.";
-
-            const auto creation_result = CreateImpl(user_space_to_reserve, std::move(initialize_callback), permissions);
-            // If the shared memory segment could not be created because another process has created it or has acquired
-            // the lock to create it, wait for the other process to create it.
-            if (!creation_result.has_value())
-            {
-                // Create() should terminate for any other error
-                std::stringstream s{};
-                s << "Creating shared memory region failed with errno:" << creation_result.error();
-                SCORE_LANGUAGE_FUTURECPP_ASSERT_PRD_MESSAGE(
-                    ((creation_result.error() == Error::Code::kDeviceOrResourceBusy) ||
-                     (creation_result.error() == Error::Code::kObjectExists)),
-                    s.str().c_str());
-
-                score::mw::log::LogDebug("shm")
-                    << "Could not create shared-memory region with errno:" << creation_result.error()
-                    << "Another process is creating or has already created it. Attempting to open.";
-
-                return OpenImpl(open_read_write);
-            }
+            return {};
         }
-        else
+
+        // If the shared memory segment could not be created because another process has created it or has acquired
+        // the lock to create it, wait for the other process to create it.
+        // Create() should terminate for any other error
+        std::stringstream s{};
+        s << "Creating shared memory region failed with errno:" << creation_result.error();
+        SCORE_LANGUAGE_FUTURECPP_ASSERT_PRD_MESSAGE(((creation_result.error() == Error::Code::kDeviceOrResourceBusy) ||
+                                                     (creation_result.error() == Error::Code::kObjectExists)),
+                                                    s.str().c_str());
+
+        score::mw::log::LogDebug("shm") << "Could not create shared-memory region with errno:"
+                                        << creation_result.error()
+                                        << "Another process is creating or has already created it. Attempting to open.";
+
+        open_result = OpenImpl(open_read_write);
+        // If the lock was held by a concurrent opener, not by a creator, nobody has created the region yet. Then we
+        // have to try to create it again.
+        const bool retry_creation = (creation_result.error() == Error::Code::kDeviceOrResourceBusy) &&
+                                    !open_result.has_value() &&
+                                    (open_result.error() == Error::Code::kNoSuchFileOrDirectory);
+        if (!retry_creation)
         {
-            score::mw::log::LogFatal("shm")
-                << __func__ << __LINE__ << "Unexpected error while opening Shared Memory Resource" << *path
-                << "with errno" << open_result.error();
-            std::terminate();
+            return open_result;
         }
     }
-    return {};
+    return open_result;
 }
 
 score::cpp::expected_blank<Error> SharedMemoryResource::OpenImpl(const bool is_read_write)

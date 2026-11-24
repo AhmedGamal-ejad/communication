@@ -342,7 +342,7 @@ class SharedMemoryResource : public ISharedMemoryResource, public std::enable_sh
     /// \return in case of error an score::os::Error is returned.
     // coverity[autosar_cpp14_m7_3_1_violation] false-positive: class method (Ticket-234468)
     score::cpp::expected_blank<score::os::Error> CreateImpl(const std::size_t user_space_to_reserve,
-                                                            const InitializeCallback initialize_callback,
+                                                            const InitializeCallback& initialize_callback,
                                                             const UserPermissions& permissions);
 
     /// \brief Called by SharedMemoryResource::CreateOrOpen() after calling the constructor.
